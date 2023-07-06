@@ -1,0 +1,184 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare
+        id: prep
+        run: echo ::set-output name=tag::joincomet/server:${GITHUB_REF#refs/tags/}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Cache Docker layers
+        uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@v2
+        with:
+          file: server/Dockerfile
+          push: true
+          tags: ${{ steps.prep.outputs.tag }},joincomet/server:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new
+      - # Temp fix
+        # https://github.com/docker/build-push-action/issues/252
+        # https://github.com/moby/buildkit/issues/1896
+        name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
+        with:
+          node-version: 16
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
+      - uses: actions/cache@v2
+        id: yarn-cache # use this to check for `cache-hit` (`steps.yarn-cache.outputs.cache-hit != 'true'`)
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Install dependencies
+        run: yarn
+      - run: yarn run build:web
+        env:
+          VITE_API_DOMAIN: ${{ secrets.API_DOMAIN }}
+          VITE_BTC_ADDRESS: ${{ secrets.BTC_ADDRESS }}
+          VITE_ETH_ADDRESS: ${{ secrets.ETH_ADDRESS }}
+      - uses: actions/upload-artifact@v2
+        with:
+          name: dist-web
+          path: web/dist/
+
+  electron:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v2
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v2
+        with:
+          node-version: 16
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
+      - uses: actions/cache@v2
+        id: yarn-cache # use this to check for `cache-hit` (`steps.yarn-cache.outputs.cache-hit != 'true'`)
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Prepare for app notarization
+        if: startsWith(matrix.os, 'macos')
+        # Import Apple API key for app notarization on macOS
+        run: |
+          mkdir -p ~/private_keys/
+          echo '${{ secrets.api_key }}' > ~/private_keys/AuthKey_${{ secrets.api_key_id }}.p8
+      - name: Build/release Electron app
+        uses: samuelmeuli/action-electron-builder@v1
+        with:
+          build_script_name: build
+          package_root: electron
+          github_token: ${{ secrets.github_token }}
+          max_attempts: 3
+          # If the commit is tagged with a version (e.g. "v1.0.0"), release the app after building
+          release: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          mac_certs: ${{ secrets.mac_certs }}
+          mac_certs_password: ${{ secrets.mac_certs_password }}
+        env:
+          VITE_API_DOMAIN: ${{ secrets.API_DOMAIN }}
+          # macOS notarization API key
+          API_KEY_ID: ${{ secrets.api_key_id }}
+          API_KEY_ISSUER_ID: ${{ secrets.api_key_issuer_id }}
+
+  deploy:
+    needs: [server]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare
+        id: prep
+        run: echo ::set-output name=tag::${GITHUB_REF#refs/tags/}
+      - name: Checkout main
+        uses: actions/checkout@v2
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - name: Update deployment file tags
+        run: |
+          TAG=${{ steps.prep.outputs.tag }}
+          ACCESS_TOKEN_SECRET=$(printf '%s\n' "${{ secrets.ACCESS_TOKEN_SECRET }}" | sed -e 's/[]\/$*.^[]/\\&/g');
+          AWS_SECRET_ACCESS_KEY=$(printf '%s\n' "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | sed -e 's/[]\/$*.^[]/\\&/g');
+          COMET_USER_PASSWORD=$(printf '%s\n' "${{ secrets.COMET_USER_PASSWORD }}" | sed -e 's/[]\/$*.^[]/\\&/g');
+          sed -i "s/<TAG>/$TAG/g" .do/app.yaml
+          sed -i "s/<ACCESS_TOKEN_SECRET>/$ACCESS_TOKEN_SECRET/g" .do/app.yaml
+          sed -i "s/<BUCKET>/${{ secrets.BUCKET }}/g" .do/app.yaml
+          sed -i "s/<AWS_ACCESS_KEY_ID>/${{ secrets.AWS_ACCESS_KEY_ID }}/g" .do/app.yaml
+          sed -i "s/<AWS_SECRET_ACCESS_KEY>/$AWS_SECRET_ACCESS_KEY/g" .do/app.yaml
+          sed -i "s/<AWS_ENDPOINT>/${{ secrets.AWS_ENDPOINT }}/g" .do/app.yaml
+          sed -i "s/<MEDIA_DOMAIN>/${{ secrets.MEDIA_DOMAIN }}/g" .do/app.yaml
+          sed -i "s/<COMET_USER_PASSWORD>/$COMET_USER_PASSWORD/g" .do/app.yaml
+      - name: Update app spec
+        run: doctl apps update ${{ secrets.DIGITALOCEAN_APP_ID }} --spec .do/app.yaml
+
+  pages:
+    needs: [web]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - uses: actions/download-artifact@v2
+        with:
+          name: dist-web
+          path: web/dist
+      - name: Deploy 🚀
+        uses: JamesIves/github-pages-deploy-action@4.1.2
+        with:
+          branch: gh-pages
+          folder: web/dist
+          clean: true
+          clean-exclude: |
+            404.html
+
+  release:
+    needs: [electron]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from ref
+        id: get-version
+        run: |
+          ver=$(echo ${GITHUB_REF/refs\/tags\//} | cut -c 2-)
+          echo ::set-output name=VERSION::$ver
+      - name: Publish release on GitHub
+        uses: test-room-7/action-publish-release-drafts@v0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag-name: ${{ steps.get-version.outputs.VERSION }}
