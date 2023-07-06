@@ -41,5 +41,5 @@ databases:
     db_name: defaultdb
     db_user: doadmin
 domains:
-  - domain: egonaut.github.io
+  - domain: egonaut.github.io/web/
     type: PRIMARY
